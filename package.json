@@ -1,0 +1,21 @@
+{
+  "name": "SOUIY - STOBIX AUTO BOT",
+  "version": "1.0.0",
+  "description": "Stobix Auto Run Node.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.8.4",
+    "cfonts": "^3.3.0",
+    "inquirer": "^8.2.6",
+    "chalk": "^4.1.2",
+    "ethers": "^6.13.7",
+    "fs": "^0.0.1-security",
+    "https-proxy-agent": "^7.0.6",
+    "ora": "^6.3.1",
+    "socks-proxy-agent": "^8.0.5"
+  }
+}

@@ -183,7 +183,14 @@ async function completeTasks(walletAddress, proxy, token) {
       const task = tasks[i];
       const { id, claimedAt } = task;
 
-      if (id === 'create_futures' || id === 'create_dual') {
+      // 修改后的过滤条件
+      if (id === 'create_dual' || 
+          id === 'create_futures_btc' || 
+          id === 'create_futures_eth' || 
+          id === 'create_futures_sol' || 
+          id === 'create_dual_100' ||
+          id === 'publish_video' ||
+          id === 'create_futures') {
         continue;
       }
 

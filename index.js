@@ -7,6 +7,7 @@ import { Wallet } from 'ethers';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import fs from 'fs/promises';
+import puppeteer from 'puppeteer';
 
 function delay(seconds) {
   return new Promise(resolve => setTimeout(resolve, seconds * 1000));
@@ -143,28 +144,30 @@ async function authenticateWallet(walletAddress, privateKey, proxy) {
   const spinnerAuth = ora({ text: ' Process Login...', spinner: 'dots2', color: 'cyan' }).start();
 
   try {
-    const nonceUrl = 'https://api.stobix.com/v1/auth/nonce';
-    const noncePayload = { address: walletAddress };
-    const nonceResponse = await requestWithRetry('post', nonceUrl, noncePayload, getAxiosConfig(proxy));
-    const { nonce, message } = nonceResponse.data;
+    // 1. 用 Puppeteer 获取 nonce/message
+    const { nonce, message } = await getNonceWithPuppeteer(walletAddress);
 
     spinnerAuth.text = ' Process Sign Wallet...';
     await delay(0.5);
 
+    // 2. 用 Node.js 签名
     const signature = await wallet.signMessage(message);
-    spinnerAuth.text = ' Sign Success...';
+
+    spinnerAuth.text = ' Process Verify...';
     await delay(0.5);
 
-    const verifyUrl = 'https://api.stobix.com/v1/auth/web3/verify';
-    const verifyPayload = { nonce, signature, chain: 8453 };
-    const verifyResponse = await requestWithRetry('post', verifyUrl, verifyPayload, getAxiosConfig(proxy));
-    const { token } = verifyResponse.data;
+    // 3. 用 Puppeteer 完成 verify
+    const verifyResult = await getTokenWithPuppeteer(walletAddress, signature, nonce);
+
+    if (!verifyResult.token) {
+      spinnerAuth.fail(chalk.redBright(` Login Failed: ${verifyResult.message || 'No token returned'}`));
+      throw new Error(verifyResult.message || 'No token returned');
+    }
 
     spinnerAuth.succeed(chalk.greenBright(' Login Successfully'));
-    return token;
+    return verifyResult.token;
   } catch (error) {
-    const errorMessage = error.response?.data?.message || error.response?.data?.error || error.message;
-    spinnerAuth.fail(chalk.redBright(` Login Failed: ${errorMessage}`));
+    spinnerAuth.fail(chalk.redBright(` Login Failed: ${error.message}`));
     throw error;
   }
 }
@@ -265,43 +268,179 @@ async function getUserPoints(proxy, token) {
   }
 }
 
+// Puppeteer工具函数
+async function launchBrowser(proxy = null) {
+  const args = ['--no-sandbox', '--disable-setuid-sandbox'];
+  if (proxy && proxy.includes('@')) {
+    // 只取 host:port 部分
+    const hostPort = proxy.split('@')[1];
+    args.push(`--proxy-server=${hostPort}`);
+  } else if (proxy) {
+    args.push(`--proxy-server=${proxy}`);
+  }
+  return puppeteer.launch({ headless: true, args });
+}
+
+async function newPage(browser, proxy = null) {
+  const page = await browser.newPage();
+  await page.setUserAgent(getRandomUserAgent());
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+  // 如果有用户名密码，自动认证
+  if (proxy && proxy.includes('@')) {
+    const match = proxy.match(/\/\/(.*?):(.*?)@/);
+    if (match) {
+      await page.authenticate({
+        username: match[1],
+        password: match[2]
+      });
+    }
+  }
+  return page;
+}
+
+// 获取任务列表
+async function getLoyaltyWithPuppeteer(page, token) {
+  return await page.evaluate(async (token) => {
+    const res = await fetch('https://api.stobix.com/v1/loyalty', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    return await res.json();
+  }, token);
+}
+
+// 领取任务
+async function claimTaskWithPuppeteer(page, token, taskId) {
+  return await page.evaluate(async (token, taskId) => {
+    const res = await fetch('https://api.stobix.com/v1/loyalty/tasks/claim', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({ taskId })
+    });
+    return await res.json();
+  }, token, taskId);
+}
+
+// 开始挖矿
+async function startMiningWithPuppeteer(page, token) {
+  return await page.evaluate(async (token) => {
+    const res = await fetch('https://api.stobix.com/v1/loyalty/points/mine', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    return await res.json();
+  }, token);
+}
+
+// 查询积分
+async function getUserPointsWithPuppeteer(page, token) {
+  const data = await getLoyaltyWithPuppeteer(page, token);
+  return data.user?.points ?? null;
+}
+
+// 修改：接收 page 参数
+async function getNonceWithPuppeteer(page, address) {
+  await page.goto('https://app.stobix.com', { waitUntil: 'networkidle2' });
+  return await page.evaluate(async (address) => {
+    const res = await fetch('https://api.stobix.com/v1/auth/nonce', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address })
+    });
+    return await res.json();
+  }, address);
+}
+
+async function getTokenWithPuppeteer(page, nonce, signature) {
+  return await page.evaluate(async (nonce, signature) => {
+    const res = await fetch('https://api.stobix.com/v1/auth/web3/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce, signature, chain: 8453 })
+    });
+    return await res.json();
+  }, nonce, signature);
+}
+
+// 主流程只创建一次 browser/page，所有 puppeteer 操作都用同一个 page
 async function processAccount(account, index, total, proxy) {
   const { walletAddress, privateKey } = account;
   console.log(`\n`);
   console.log(chalk.bold.cyanBright('='.repeat(80)));
   console.log(chalk.bold.whiteBright(`Akun: ${index + 1}/${total}`));
   console.log(chalk.bold.whiteBright(`Wallet: ${walletAddress}`));
-  const usedIP = await getPublicIP(proxy);
-  console.log(chalk.bold.whiteBright(`Using IP: ${usedIP}`));
   console.log(chalk.bold.cyanBright('='.repeat(80)));
 
+  let browser;
   try {
+    browser = await launchBrowser(proxy);
+    const page = await newPage(browser, proxy);
+
+    // 1. 登录
+    const spinnerAuth = ora({ text: ' Process Login...', spinner: 'dots2', color: 'cyan' }).start();
+    const { nonce, message } = await getNonceWithPuppeteer(page, walletAddress);
     const wallet = new Wallet(privateKey);
-    if (wallet.address.toLowerCase() !== walletAddress.toLowerCase()) {
-      throw new Error('Private key does not match wallet address');
+    const signature = await wallet.signMessage(message);
+    const verifyResult = await getTokenWithPuppeteer(page, nonce, signature);
+    if (!verifyResult.token) throw new Error(verifyResult.message || 'No token returned');
+    spinnerAuth.succeed(chalk.greenBright(' Login Successfully'));
+    const token = verifyResult.token;
+
+    // 2. 任务
+    const spinnerTasks = ora({ text: ' Fetching Task List...', spinner: 'dots2', color: 'cyan' }).start();
+    const loyalty = await getLoyaltyWithPuppeteer(page, token);
+    spinnerTasks.succeed(chalk.greenBright(' Task List Received'));
+    for (const task of loyalty.tasks) {
+      const { id, claimedAt } = task;
+      if (
+        id === 'create_dual' ||
+        id === 'create_futures_btc' ||
+        id === 'create_futures_eth' ||
+        id === 'create_futures_sol' ||
+        id === 'create_dual_100' ||
+        id === 'publish_video' ||
+        id === 'create_futures'
+      ) continue;
+      if (claimedAt !== null) {
+        console.log(chalk.bold.greenBright(`  🎯 Task ${id} Already Done`));
+        continue;
+      }
+      const spinnerClaim = ora({ text: `  Completing Task ${id}...`, spinner: 'dots2', color: 'cyan' }).start();
+      try {
+        await claimTaskWithPuppeteer(page, token, id);
+        spinnerClaim.succeed(chalk.greenBright(` Completing Task ${id} Successfully`));
+      } catch (e) {
+        spinnerClaim.fail(chalk.redBright(` Failed Completing Task ${id}: ${e.message}`));
+      }
     }
+
+    // 3. 挖矿
+    const spinnerMine = ora({ text: ' Started Mining...', spinner: 'dots2', color: 'cyan' }).start();
+    try {
+      await startMiningWithPuppeteer(page, token);
+      spinnerMine.succeed(chalk.greenBright(` Mining Started Successfully`));
+    } catch (e) {
+      spinnerMine.fail(chalk.redBright(` Failed To Start Mining: ${e.message}`));
+    }
+
+    // 4. 查询积分
+    const spinnerPoints = ora({ text: ' Getting Points...', spinner: 'dots2', color: 'cyan' }).start();
+    try {
+      const points = await getUserPointsWithPuppeteer(page, token);
+      spinnerPoints.succeed(chalk.greenBright(` Total Points: ${points}`));
+    } catch (e) {
+      spinnerPoints.fail(chalk.redBright(` Error Getting Points: ${e.message}`));
+    }
+
+    await browser.close();
   } catch (error) {
-    console.error(chalk.red(`Invalid wallet: ${error.message}`));
-    return;
+    if (browser) await browser.close();
+    console.error(chalk.red(`Error: ${error.message}`));
   }
-
-  let token;
-  try {
-    token = await authenticateWallet(walletAddress, privateKey, proxy);
-  } catch (error) {
-    console.error(chalk.red(`Error autentikasi: ${error.message}`));
-    return;
-  }
-
-  await completeTasks(walletAddress, proxy, token);
-
-  try {
-    await startMining(proxy, token);
-  } catch (error) {
-    console.error(chalk.red(` Mining Error , Skipping Mining Procces: ${error.message}`));
-  }
-
-  await getUserPoints(proxy, token);
 }
 
 async function main() {
@@ -363,5 +502,8 @@ function askQuestion(query) {
     resolve(ans);
   }));
 }
+
+// 安装 puppeteer
+// npm install puppeteer
 
 main();
